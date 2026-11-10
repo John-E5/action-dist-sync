@@ -1,6 +1,6 @@
-import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { cp, lstat, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, posix } from 'node:path';
+import { isAbsolute, join, posix, relative, sep } from 'node:path';
 import type { Exec, ExecResult } from './exec.js';
 
 export const DEFAULTS = { distPath: 'dist', workflow: 'dist.yml', artifact: 'action-dist' } as const;
@@ -109,12 +109,12 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
     log(`Cloning ${headRepo}:${headRef}`);
     await must('git', ['-c', 'core.autocrlf=false', 'clone', '-q', '--depth', '1', '--branch', headRef, `https://github.com/${headRepo}.git`, clone], `Cloning ${headRepo}`);
 
-    const target = join(clone, ...distPath.split('/'));
+    const target = await checkNoSymlinks(clone, distPath, `${headRepo}:${headRef}`);
     await rm(target, { recursive: true, force: true });
     await mkdir(target, { recursive: true });
     await cp(bundle, target, { recursive: true });
 
-    await must('git', ['-c', 'core.autocrlf=false', 'add', '-A', '--', distPath], 'Staging the bundle', clone);
+    await must('git', ['--literal-pathspecs', '-c', 'core.autocrlf=false', 'add', '-A', '--', distPath], 'Staging the bundle', clone);
     const diff = await run('git', ['diff', '--cached', '--quiet'], clone);
     if (diff.code === 0) return { status: 'in-sync', headRepo, headRef };
     if (diff.code !== 1) throw new SyncError(`Comparing the bundle failed: ${diff.stderr.trim()}`, 2);
@@ -128,11 +128,47 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
   }
 }
 
-/** Normalises to a forward-slash path inside the repo; rejects absolute paths, `.` and anything climbing out with `..`. */
+/**
+ * Normalises to a forward-slash path inside the repo. Rejects absolute and drive-relative paths (`C:foo`), `.`, anything
+ * climbing out with `..`, any segment with a `:` (pathspec magic, NTFS streams) and any `.git` segment.
+ */
 function checkDistPath(input: string): string {
   const path = posix.normalize(input.replace(/\\/g, '/')).replace(/\/+$/, '');
-  if (input.trim() === '' || isAbsolute(input) || path.startsWith('/') || path === '.' || path === '..' || path.startsWith('../')) {
+  const segments = path.split('/');
+  if (
+    input.trim() === '' ||
+    isAbsolute(input) ||
+    path.startsWith('/') ||
+    path === '.' ||
+    path === '..' ||
+    path.startsWith('../') ||
+    segments.some((s) => s.includes(':') || s.toLowerCase().replace(/[. ]+$/, '') === '.git')
+  ) {
     throw new SyncError(`--dist-path must be a folder inside the repository, got "${input}"`, 2);
   }
   return path;
+}
+
+/**
+ * The fork controls the clone's contents, so a symlinked `dist-path` (or a symlinked folder above it) could point rm and
+ * cp outside the temp dir. Refuses when any of them is a symlink, or resolves outside the clone. Returns the target path.
+ */
+async function checkNoSymlinks(clone: string, distPath: string, where: string): Promise<string> {
+  const root = await realpath(clone);
+  let at = clone;
+  for (const segment of distPath.split('/')) {
+    at = join(at, segment);
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(at)).isSymbolicLink();
+    } catch (err) {
+      if ((err as { code?: unknown }).code === 'ENOENT') break;
+      throw err;
+    }
+    const inside = relative(root, await realpath(at));
+    if (isLink || inside === '' || inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
+      throw new SyncError(`${distPath} on ${where} goes through a symlink (${relative(clone, at)}). Refusing to write there.`, 1);
+    }
+  }
+  return at;
 }

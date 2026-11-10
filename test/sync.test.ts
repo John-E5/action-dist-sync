@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Exec, ExecResult } from '../src/exec.js';
@@ -144,9 +145,12 @@ describe('syncFork', () => {
     refuses({ 'gh pr view': () => Promise.reject(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' })) }, 'needs the GitHub CLI', 2));
 
   it('rejects a dist path outside the repo before calling anything', async () => {
-    for (const distPath of ['../dist', '/abs/dist', '.', '']) {
+    const B = String.fromCharCode(92);
+    const bad = ['../dist', '/abs/dist', '.', '', `dist${B}..${B}..`, `..${B}`, 'C:foo', 'dist/C:foo', ':(glob)*', '.git', 'dist/.git', 'x/../.git/hooks', '.GIT', '.git.'];
+    for (const distPath of bad) {
       const f = fake();
       const error = await syncFork({ pr: 7, repo: 'o/r', distPath }, f.exec).catch((e: unknown) => e);
+      expect(error, distPath).toBeInstanceOf(SyncError);
       expect((error as SyncError).exitCode).toBe(2);
       expect(f.calls).toHaveLength(0);
     }
@@ -180,4 +184,53 @@ describe('syncFork', () => {
   it("reports a failed push with git's message", () => refuses({ 'git push': () => fail('! [rejected] HEAD -> fix-typo (fetch first)') }, '[rejected] HEAD -> fix-typo', 2));
 
   it("reports a failed comparison with git's message", () => refuses({ 'git diff': () => fail('fatal: bad object HEAD') }, 'bad object HEAD', 2));
+
+  it('stages the bundle with literal pathspecs', async () => {
+    const f = fake();
+    await syncFork({ pr: 7, repo: 'o/r' }, f.exec);
+    expect(f.calls.find((c) => words(c.args)[0] === 'add')!.args[0]).toBe('--literal-pathspecs');
+  });
+
+  /** A fake clone where `link` (relative to the clone) is a symlink to a folder outside it. Returns null when symlinks can't be made here. */
+  const symlinked = (link: string, distPath: string) => {
+    const outside = mkdtempSync(join(tmpdir(), 'ads-outside-'));
+    mkdirSync(join(outside, 'action', 'dist'), { recursive: true });
+    writeFileSync(join(outside, 'keep.js'), 'precious');
+    writeFileSync(join(outside, 'action', 'dist', 'keep.js'), 'precious');
+    let made = true;
+    const f = fake({
+      'git clone': ({ args }) => {
+        const at = join(args.at(-1)!, ...link.split('/'));
+        mkdirSync(dirname(at), { recursive: true });
+        try {
+          symlinkSync(outside, at, 'junction');
+        } catch {
+          made = false;
+        }
+        return ok();
+      },
+    });
+    return { run: () => syncFork({ pr: 7, repo: 'o/r', distPath }, f.exec), outside, made: () => made, f };
+  };
+
+  for (const [link, distPath] of [
+    ['packages', 'packages/action/dist'],
+    ['dist', 'dist'],
+  ] as const) {
+    it(`refuses to write through a symlinked ${link} in the fork (dist-path ${distPath})`, async (ctx) => {
+      const s = symlinked(link, distPath);
+      try {
+        const error = await s.run().catch((e: unknown) => e);
+        if (!s.made()) ctx.skip();
+        expect(error).toBeInstanceOf(SyncError);
+        expect((error as SyncError).exitCode).toBe(1);
+        expect((error as SyncError).message).toContain('symlink');
+        expect(readFileSync(join(s.outside, 'keep.js'), 'utf8')).toBe('precious');
+        expect(readFileSync(join(s.outside, 'action', 'dist', 'keep.js'), 'utf8')).toBe('precious');
+        expect(keys(s.f.calls)).not.toContain('git add');
+      } finally {
+        rmSync(s.outside, { recursive: true, force: true });
+      }
+    });
+  }
 });
