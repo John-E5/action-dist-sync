@@ -24,7 +24,9 @@ JavaScript Actions commit a built `dist/` (from ncc, esbuild or Rollup), because
 2. If the bundle matches, it passes. **Same-repo PR:** it commits the rebuilt bundle to the branch. **Fork PR:** it uploads the bundle as an artifact and fails with a clear message.
 3. A maintainer runs `npx action-dist-sync <pr>`. That applies the artifact to the fork's branch, using "Allow edits by maintainers", and the checks run again.
 
-Contributors never build `dist/`, and fork code never gets a write token: the workflow runs on `pull_request`, never `pull_request_target`.
+Contributors never build `dist/`, and the PR's code never runs next to a write token:
+- The workflow runs on `pull_request`, never `pull_request_target`, so fork PRs only ever get a read-only token.
+- The build runs in its own job, with a read-only token and no stored git credentials. A second job, which runs nothing from the PR, compares the bundle and does the commit and push.
 
 ## Setup
 
@@ -45,7 +47,9 @@ jobs:
     #   push-token: ${{ secrets.DIST_PUSH_TOKEN }}  # optional, see below
 ```
 
-If you use the official template's `check-dist` job, remove it. If branch protection requires a check, make it **`dist / dist is up to date`**.
+The caller must grant `permissions: contents: write`, as above. Without it, on a repository whose default token is read-only, every run fails at startup. On fork PRs GitHub still gives the workflow a read-only token, whatever the caller grants.
+
+If you use the official template's `check-dist` job, remove it. If branch protection requires a check, make it **`dist / dist is up to date`**. It fails when the build fails, too. The workflow also shows a `dist / build dist` check, which you don't need to require.
 
 `@v0` follows the latest 0.x release. Pin `@v0.1.0` if you prefer.
 
@@ -60,7 +64,15 @@ If you use the official template's `check-dist` job, remove it. If branch protec
 
 GitHub doesn't start new workflow runs for a push made with the default `GITHUB_TOKEN`. So after the workflow commits the bundle to a same-repo PR, the new commit has no checks, and a required check stays pending.
 
-Fix this with a token in the `push-token` secret: a fine-grained PAT with Contents read/write on this repo, or a GitHub App token. Without one, re-run the checks from the PR page, or push an empty commit.
+Fix this with a fine-grained PAT in the `push-token` secret, with Contents read/write on this repo only. Without one, re-run the checks from the PR page, or push an empty commit.
+
+**Dependabot:** Dependabot PRs can't read your Actions secrets, so add `DIST_PUSH_TOKEN` under the repository's Dependabot secrets too. Without it, the sync commit on a Dependabot PR is pushed with `GITHUB_TOKEN`, and its checks don't run again.
+
+If the bundle still differs straight after a sync commit, the workflow fails instead of pushing again: the build isn't deterministic on the runner.
+
+### After the bot commits
+
+On a same-repo PR the bot adds a commit to the branch. Pull it before you push again, or your push is rejected.
 
 ## The maintainer command
 
@@ -72,6 +84,8 @@ npx action-dist-sync <pr> [--repo owner/name] [--dist-path dist] [--workflow dis
 - The [GitHub CLI](https://cli.github.com), signed in. The clone and push use gh's credentials directly, whatever credential helper git has, and never prompt. No `gh auth setup-git` is needed.
 - `git` on PATH, with your name and email configured for the commit.
 - "Allow edits by maintainers" ticked on the PR.
+
+**Review first.** The artifact is built by the fork's own code, including its build scripts and `package.json`. Before applying it, review any changes to how the bundle is built, just as you review the source.
 
 **It checks before touching anything:**
 - The PR must come from a fork that still exists.
