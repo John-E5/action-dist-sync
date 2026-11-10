@@ -1,0 +1,4 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": { ".": { "release-type": "node", "package-name": "action-dist-sync", "include-component-in-tag": false } }
+}

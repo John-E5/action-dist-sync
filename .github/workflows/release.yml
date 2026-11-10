@@ -1,0 +1,42 @@
+name: Release
+
+# Release-please opens a release PR from conventional commits. Merging it tags a
+# release, and this workflow then publishes to npm with trusted publishing (OIDC, no
+# NPM_TOKEN). One-time setup: publish 0.1.0 by hand, then add this repo and
+# workflow as a trusted publisher on npmjs.com (package settings), and push the v0.1.0
+# and v0 tags by hand. Later releases move the v0 tag themselves.
+# Release PRs are opened with GITHUB_TOKEN, so CI does not run on them. If checks
+# are required, a maintainer re-runs them or merges with admin.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+      - if: ${{ steps.release.outputs.release_created }}
+        uses: actions/checkout@v7
+      - if: ${{ steps.release.outputs.release_created }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - if: ${{ steps.release.outputs.release_created }}
+        run: npm install -g npm@^11.5.1
+      - if: ${{ steps.release.outputs.release_created }}
+        run: npm ci && npm run build && npm publish --provenance --access public
+      # Action users pin @v0 (the latest 0.x release), so move that tag once the matching CLI is on npm.
+      - if: ${{ steps.release.outputs.release_created }}
+        env:
+          MAJOR: ${{ steps.release.outputs.major }}
+        run: git tag -f "v${MAJOR}" && git push -f origin "v${MAJOR}"

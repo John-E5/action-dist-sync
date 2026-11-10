@@ -1,0 +1,98 @@
+name: Sync dist bundle
+
+# Reusable workflow: rebuild an Action's committed bundle on CI so contributors never build it themselves.
+#   Same-repo PRs: the rebuilt bundle is committed back to the PR branch.
+#   Fork PRs: this job can't push to the fork, so it uploads the bundle as an artifact and fails;
+#             a maintainer applies it with `npx action-dist-sync <pr>`.
+# Call it from a workflow triggered by `pull_request` (never pull_request_target: fork code must not get a write token).
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: Builds the bundle.
+        type: string
+        default: npm ci && npm run build
+      dist-path:
+        description: The bundle folder, relative to the repo root.
+        type: string
+        default: dist
+      node-version:
+        type: string
+        default: "22"
+      artifact-name:
+        description: Name of the artifact uploaded on fork PRs.
+        type: string
+        default: action-dist
+    secrets:
+      push-token:
+        description: Optional PAT or GitHub App token for the same-repo push. A push made with GITHUB_TOKEN starts no new workflow runs, so required checks stay pending on the new commit; a token avoids that.
+        required: false
+
+jobs:
+  sync:
+    name: dist is up to date
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the PR branch
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.push-token || github.token }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: bash -c "$BUILD_COMMAND"
+
+      - name: Compare, and commit on same-repo PRs
+        id: sync
+        env:
+          DIST_PATH: ${{ inputs.dist-path }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          # --porcelain also catches new untracked files, which git diff misses.
+          if [ -z "$(git status --porcelain -- "$DIST_PATH")" ]; then
+            echo "$DIST_PATH is already in sync."
+            exit 0
+          fi
+          echo "$DIST_PATH is out of date:"
+          git status --short -- "$DIST_PATH"
+          if [ "$SAME_REPO" != "true" ]; then
+            echo "fork=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -A -- "$DIST_PATH"
+          git commit -m "build: sync dist bundle"
+          git push origin "HEAD:${HEAD_REF}"
+          echo "Pushed the rebuilt bundle to ${HEAD_REF}."
+
+      - name: Upload the bundle (fork PRs)
+        if: steps.sync.outputs.fork == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.dist-path }}
+          retention-days: 7
+          include-hidden-files: true
+
+      - name: Fail until a maintainer applies it (fork PRs)
+        if: steps.sync.outputs.fork == 'true'
+        env:
+          DIST_PATH: ${{ inputs.dist-path }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          echo "::error::${DIST_PATH} needs the CI-built bundle. Contributors: nothing to do, please don't commit ${DIST_PATH} yourself. Maintainers: npx action-dist-sync ${PR}"
+          exit 1
