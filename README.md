@@ -73,18 +73,24 @@ npx action-dist-sync <pr> [--repo owner/name] [--dist-path dist] [--workflow dis
 - `git` on PATH, with your name and email configured for the commit.
 - "Allow edits by maintainers" ticked on the PR.
 
-**It checks before touching anything:** the PR must come from a fork, maintainers must be allowed to edit it, and the workflow run for the head commit must have finished with the artifact present.
+**It checks before touching anything:**
+- The PR must come from a fork that still exists.
+- Maintainers must be allowed to edit it.
+- The workflow run for the head commit must have finished.
+
+If that run passed, CI already found the bundle in sync, so it stops there and changes nothing. Otherwise it downloads the artifact.
 
 **Then it:**
-1. Shallow-clones the fork branch.
-2. Replaces `dist-path` with the artifact.
-3. Commits `build: sync dist bundle`, and pushes.
+1. Shallow-clones the fork branch, and checks the branch hasn't moved past the commit the run built.
+2. Replaces `dist-path` with the artifact. It refuses if `dist-path`, or a folder above it, is a symlink in the fork.
+3. Commits `build: sync dist bundle`, and pushes. If the bundle already matches, it stops and changes nothing.
 
-If the bundle already matches, it stops and changes nothing.
+**Defaults:** `--repo` defaults to the repository in the current folder, and `--workflow` matches the file name of your caller workflow (`dist.yml` above). `--dist-path` must be a folder inside the repository; it can't contain `..` past the root, a `:`, or a `.git` folder.
 
-**Defaults:** `--repo` defaults to the repository in the current folder, and `--workflow` matches the file name of your caller workflow (`dist.yml` above).
-
-**Exit codes:** 0 when it pushed the bundle or there was nothing to do; 1 when the PR can't be synced yet (the message says why); 2 for a setup or tool problem.
+**Exit codes:**
+- **0:** it pushed the bundle, or the bundle was already in sync.
+- **1:** the PR can't be synced as it stands, and the message says why. For example: it isn't from a fork, the fork was deleted, maintainer edits are off, the run hasn't finished, the artifact is missing or expired, the branch moved since the run, or `dist-path` is a symlink.
+- **2:** a setup or tool problem, with the `gh` or `git` error. For example: `gh` is missing or signed out, a download or push failed, or the arguments are invalid.
 
 ## Requirements
 

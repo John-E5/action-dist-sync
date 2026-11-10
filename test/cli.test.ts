@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { parseCli } from '../src/cli.js';
+import { outcome, parseCli } from '../src/cli.js';
 import { SyncError } from '../src/sync.js';
 
 describe('parseCli', () => {
@@ -29,6 +29,13 @@ describe('parseCli', () => {
       expect(error).toBeInstanceOf(SyncError);
       expect((error as SyncError).exitCode).toBe(2);
     }
+  });
+});
+
+describe('outcome', () => {
+  it('says what happened', () => {
+    expect(outcome({ status: 'in-sync', headRepo: 'c/r', headRef: 'b' })).toBe('Bundle already in sync on c/r:b.');
+    expect(outcome({ status: 'pushed', headRepo: 'c/r', headRef: 'b' })).toBe("Pushed the CI-built bundle to c/r:b. The PR's checks will run again.");
   });
 });
 

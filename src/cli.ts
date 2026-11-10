@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { realExec } from './exec.js';
-import { DEFAULTS, syncFork, SyncError, type SyncOptions } from './sync.js';
+import { DEFAULTS, syncFork, SyncError, type SyncOptions, type SyncResult } from './sync.js';
 
 const USAGE = `Usage: action-dist-sync <pr> [--repo owner/name] [--dist-path ${DEFAULTS.distPath}]
                         [--workflow ${DEFAULTS.workflow}] [--artifact ${DEFAULTS.artifact}]
@@ -50,12 +50,15 @@ async function main(): Promise<number> {
     return 0;
   }
   const result = await syncFork({ ...parsed.options, log: (line) => console.log(line) }, realExec);
-  console.log(
-    result.status === 'pushed'
-      ? `Pushed the CI-built bundle to ${result.headRepo}:${result.headRef}. The PR's checks will run again.`
-      : `The bundle on ${result.headRepo}:${result.headRef} already matches CI. Nothing to do.`,
-  );
+  console.log(outcome(result));
   return 0;
+}
+
+/** The closing line for a successful run. */
+export function outcome(result: SyncResult): string {
+  return result.status === 'pushed'
+    ? `Pushed the CI-built bundle to ${result.headRepo}:${result.headRef}. The PR's checks will run again.`
+    : `Bundle already in sync on ${result.headRepo}:${result.headRef}.`;
 }
 
 const invokedDirectly = (() => {

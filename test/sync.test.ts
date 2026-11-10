@@ -32,7 +32,7 @@ function fake(overrides: Record<string, Handler> = {}) {
   const handlers: Record<string, Handler> = {
     'gh repo view': () => ok('owner/my-action\n'),
     'gh pr view': () => ok(JSON.stringify(PR)),
-    'gh run list': () => ok(JSON.stringify([{ databaseId: 42, status: 'completed' }])),
+    'gh run list': () => ok(JSON.stringify([{ databaseId: 42, status: 'completed', conclusion: 'failure' }])),
     'gh run download': ({ args }) => {
       const dir = args[args.indexOf('-D') + 1]!;
       mkdirSync(join(dir, 'licenses'), { recursive: true });
@@ -47,6 +47,7 @@ function fake(overrides: Record<string, Handler> = {}) {
       writeFileSync(join(dir, 'dist', 'stale-chunk.js'), 'old');
       return ok();
     },
+    'git rev-parse': () => ok(`${PR.headRefOid}\n`),
     'git add': () => ok(),
     'git diff': () => ({ code: 1, stdout: '', stderr: '' }),
     'git commit': ({ cwd }) => {
@@ -79,13 +80,13 @@ describe('syncFork', () => {
     const result = await syncFork({ pr: 7, repo: 'owner/my-action' }, f.exec);
     expect(result).toEqual({ status: 'pushed', headRepo: 'contrib/my-action', headRef: 'fix-typo' });
     expect(f.snapshot).toEqual({ dist: ['index.js', 'licenses'], content: 'built on CI' });
-    expect(keys(f.calls)).toEqual(['gh pr', 'gh run', 'gh run', 'git clone', 'git add', 'git diff', 'git commit', 'git push']);
+    expect(keys(f.calls)).toEqual(['gh pr', 'gh run', 'gh run', 'git clone', 'git rev-parse', 'git add', 'git diff', 'git commit', 'git push']);
     const clone = f.calls.find((c) => c.args.includes('clone'))!;
     expect(clone.args).toEqual(expect.arrayContaining(['--depth', '1', '--branch', 'fix-typo', 'https://github.com/contrib/my-action.git']));
     expect(words(f.calls.find((c) => c.args.includes('push'))!.args)).toEqual(['push', '-q', 'origin', 'HEAD:fix-typo']);
     expect(f.calls.find((c) => c.args.includes('commit'))!.args).toEqual(expect.arrayContaining(['-m', 'build: sync dist bundle']));
     const list = f.calls.find((c) => c.args[1] === 'list')!;
-    expect(list.args).toEqual(expect.arrayContaining(['--workflow', 'dist.yml', '--commit', 'abc1234def5678']));
+    expect(list.args).toEqual(expect.arrayContaining(['--workflow', 'dist.yml', '--commit', 'abc1234def5678', '--json', 'databaseId,status,conclusion']));
   });
 
   it('finds the repository with gh when --repo is not given', async () => {
@@ -136,7 +137,13 @@ describe('syncFork', () => {
     refuses({ 'gh run list': () => ok(JSON.stringify([{ databaseId: 42, status: 'in_progress' }])) }, 'still in_progress', 1));
 
   it('explains a missing artifact', () =>
-    refuses({ 'gh run download': () => ({ code: 1, stdout: '', stderr: 'no artifact matches' }) }, 'Run 42 has no action-dist artifact', 1));
+    refuses({ 'gh run download': () => fail('no valid artifacts found to download') }, 'Run 42 concluded failure and has no action-dist artifact', 1));
+
+  it('matches the missing-artifact error case-insensitively and shows it', () =>
+    refuses({ 'gh run download': () => fail('No valid artifacts found to download') }, 'No valid artifacts found to download', 1));
+
+  it('treats any other download failure as a tool problem, with its message', () =>
+    refuses({ 'gh run download': () => fail('HTTP 401: Bad credentials') }, 'HTTP 401: Bad credentials', 2));
 
   it('reports a gh failure with its own message', () =>
     refuses({ 'gh pr view': () => ({ code: 1, stdout: '', stderr: 'GraphQL: Could not resolve to a PullRequest' }) }, 'Could not resolve to a PullRequest', 2));
@@ -248,4 +255,37 @@ describe('syncFork', () => {
 
   it('points at gh auth when the push fails', () =>
     refuses({ 'git push': () => fail('fatal: could not read Username for https://github.com: terminal prompts disabled') }, "Check `gh auth status`; the push uses gh's credentials.", 2));
+
+  it("says the fork is gone when the PR's head repository was deleted", async () => {
+    for (const gone of [{ headRepository: null }, { headRepositoryOwner: null }, { headRepository: null, headRepositoryOwner: null, maintainerCanModify: false }]) {
+      await refuses({ 'gh pr view': () => ok(JSON.stringify({ ...PR, ...gone })) }, "PR #7's fork no longer exists.", 1);
+    }
+  });
+
+  it('refuses when the branch moved after the run', async () => {
+    const f = fake({ 'git rev-parse': () => ok('0000000ffffff\n') });
+    const error = await syncFork({ pr: 7, repo: 'o/r' }, f.exec).catch((e: unknown) => e);
+    expect((error as SyncError).message).toBe("PR #7's head moved since the run; wait for the new run, then try again.");
+    expect((error as SyncError).exitCode).toBe(1);
+    expect(keys(f.calls)).not.toContain('git add');
+    expect(f.calls.find((c) => words(c.args)[0] === 'rev-parse')!.cwd).toBe(f.calls.find((c) => words(c.args)[0] === 'clone')!.args.at(-1));
+  });
+
+  it('reports in-sync without downloading when the run passed', async () => {
+    const f = fake({ 'gh run list': () => ok(JSON.stringify([{ databaseId: 42, status: 'completed', conclusion: 'success' }])) });
+    const lines: string[] = [];
+    expect(await syncFork({ pr: 7, repo: 'o/r', log: (l) => lines.push(l) }, f.exec)).toEqual({ status: 'in-sync', headRepo: 'contrib/my-action', headRef: 'fix-typo' });
+    expect(keys(f.calls)).toEqual(['gh pr', 'gh run']);
+    expect(lines.join('\n')).toContain('passed');
+  });
+
+  it('names the conclusion when a run that did not pass has no artifact', () =>
+    refuses(
+      {
+        'gh run list': () => ok(JSON.stringify([{ databaseId: 42, status: 'completed', conclusion: 'cancelled' }])),
+        'gh run download': () => fail('no valid artifacts found to download'),
+      },
+      'concluded cancelled',
+      1,
+    ));
 });

@@ -49,8 +49,9 @@ export class SyncError extends Error {
 }
 
 interface PrInfo {
-  headRepositoryOwner: { login: string };
-  headRepository: { name: string };
+  /** Null once the fork is deleted. */
+  headRepositoryOwner: { login: string } | null;
+  headRepository: { name: string } | null;
   headRefName: string;
   headRefOid: string;
   maintainerCanModify: boolean;
@@ -95,19 +96,29 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
       `Reading PR #${n}`,
     ),
   ) as PrInfo;
-  const headRepo = `${pr.headRepositoryOwner.login}/${pr.headRepository.name}`;
   const headRef = pr.headRefName;
   const sha = pr.headRefOid.slice(0, 7);
 
   if (!pr.isCrossRepository) throw new SyncError(`PR #${n} isn't from a fork; the sync workflow commits same-repo PRs itself.`, 1);
+  if (!pr.headRepository || !pr.headRepositoryOwner) throw new SyncError(`PR #${n}'s fork no longer exists.`, 1);
   if (!pr.maintainerCanModify) throw new SyncError(`PR #${n} doesn't allow maintainer edits. Ask the author to tick "Allow edits by maintainers".`, 1);
+  const headRepo = `${pr.headRepositoryOwner.login}/${pr.headRepository.name}`;
 
   const runs = JSON.parse(
-    await must('gh', ['run', 'list', '-R', repo, '--workflow', workflow, '--commit', pr.headRefOid, '--limit', '1', '--json', 'databaseId,status'], `Listing ${workflow} runs`),
-  ) as Array<{ databaseId: number; status: string }>;
+    await must(
+      'gh',
+      ['run', 'list', '-R', repo, '--workflow', workflow, '--commit', pr.headRefOid, '--limit', '1', '--json', 'databaseId,status,conclusion'],
+      `Listing ${workflow} runs`,
+    ),
+  ) as Array<{ databaseId: number; status: string; conclusion: string }>;
   const latest = runs[0];
   if (!latest) throw new SyncError(`No ${workflow} run for ${sha} yet. Approve the PR's workflow runs first.`, 1);
   if (latest.status !== 'completed') throw new SyncError(`The ${workflow} run for ${sha} is still ${latest.status}. Try again when it finishes.`, 1);
+  // The workflow fails on a fork PR exactly when it uploads the bundle, so a pass means CI built the same dist-path.
+  if (latest.conclusion === 'success') {
+    log(`The ${workflow} run for ${sha} passed: CI found ${distPath} already matching its build.`);
+    return { status: 'in-sync', headRepo, headRef };
+  }
 
   const tmp = await mkdtemp(join(tmpdir(), 'action-dist-sync-'));
   try {
@@ -115,7 +126,14 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
     log(`Downloading ${artifact} from run ${latest.databaseId}`);
     const download = await run('gh', ['run', 'download', String(latest.databaseId), '-R', repo, '-n', artifact, '-D', bundle]);
     if (download.code !== 0) {
-      throw new SyncError(`Run ${latest.databaseId} has no ${artifact} artifact: the bundle is already in sync, or the artifact expired (re-run the workflow).`, 1);
+      const detail = (download.stderr || download.stdout).trim();
+      if (/no valid artifacts found/i.test(detail)) {
+        throw new SyncError(
+          `Run ${latest.databaseId} concluded ${latest.conclusion} and has no ${artifact} artifact: the build failed before uploading it, or the artifact expired (re-run the workflow). gh said: ${detail}`,
+          1,
+        );
+      }
+      throw new SyncError(`Downloading ${artifact} from run ${latest.databaseId} failed: ${detail}`, 2);
     }
 
     const clone = join(tmp, 'repo');
@@ -126,6 +144,9 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
       `Cloning ${headRepo}`,
       { env: NO_PROMPT },
     );
+    // The branch may have moved on since the run, and the bundle belongs to the commit the run built.
+    const head = await must('git', ['rev-parse', 'HEAD'], 'Reading the cloned head', { cwd: clone });
+    if (head !== pr.headRefOid) throw new SyncError(`PR #${n}'s head moved since the run; wait for the new run, then try again.`, 1);
 
     const target = await checkNoSymlinks(clone, distPath, `${headRepo}:${headRef}`);
     await rm(target, { recursive: true, force: true });
