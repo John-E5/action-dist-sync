@@ -2,9 +2,13 @@ name: Sync dist bundle
 
 # Reusable workflow: rebuild an Action's committed bundle on CI so contributors never build it themselves.
 #   Same-repo PRs: the rebuilt bundle is committed back to the PR branch.
-#   Fork PRs: this job can't push to the fork, so it uploads the bundle as an artifact and fails;
+#   Fork PRs: this workflow can't push to the fork, so it uploads the bundle as an artifact and fails;
 #             a maintainer applies it with `npx action-dist-sync <pr>`.
 # Call it from a workflow triggered by `pull_request` (never pull_request_target: fork code must not get a write token).
+#
+# Two jobs, so the PR's code never runs next to a write token:
+#   build  runs the build command with a read-only token and no stored credentials, and hands dist over as an artifact.
+#   sync   runs no code from the PR. It lays that artifact over the checkout, compares, and commits or fails.
 
 on:
   workflow_call:
@@ -26,24 +30,25 @@ on:
         default: action-dist
     secrets:
       push-token:
-        description: Optional PAT or GitHub App token for the same-repo push. A push made with GITHUB_TOKEN starts no new workflow runs, so required checks stay pending on the new commit; a token avoids that.
+        description: Optional fine-grained PAT (Contents read/write on this repo) for the same-repo push. A push made with GITHUB_TOKEN starts no new workflow runs, so required checks stay pending on the new commit; a PAT avoids that.
         required: false
 
 jobs:
-  sync:
-    name: dist is up to date
+  build:
+    name: build dist
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
     steps:
-      - name: Check out the PR branch
+      # The commit the PR event points at, so the bundle belongs to the run's head SHA.
+      - name: Check out the PR head
         uses: actions/checkout@v7
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
-          token: ${{ secrets.push-token || github.token }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -54,14 +59,82 @@ jobs:
           BUILD_COMMAND: ${{ inputs.build-command }}
         run: bash -c "$BUILD_COMMAND"
 
+      - name: Hand the bundle to the sync job
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-candidate
+          path: ${{ inputs.dist-path }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+          overwrite: true
+
+  sync:
+    name: dist is up to date
+    needs: build
+    # Runs even when the build fails, so a broken build fails this check instead of skipping it (a skipped required check passes).
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # Pushes to one PR branch never race. The prefix keeps the group apart from the caller's own groups.
+    concurrency:
+      group: action-dist-sync-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check the build passed
+        if: needs.build.result != 'success'
+        env:
+          RESULT: ${{ needs.build.result }}
+        run: |
+          echo "::error::The dist build ${RESULT}; see the build dist job."
+          exit 1
+
+      - name: Check out the PR head
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Clear the bundle folder
+        env:
+          DIST_PATH: ${{ inputs.dist-path }}
+        run: |
+          # The checkout comes from the PR, so refuse a dist-path that goes through a symlink out of the workspace.
+          at="$GITHUB_WORKSPACE"
+          IFS=/ read -ra segments <<< "$DIST_PATH"
+          for segment in "${segments[@]}"; do
+            [ -z "$segment" ] && continue
+            at="$at/$segment"
+            if [ -L "$at" ]; then
+              echo "::error::${DIST_PATH} goes through a symlink in this checkout. Refusing to write there."
+              exit 1
+            fi
+          done
+          case "$(realpath -m -- "$GITHUB_WORKSPACE/$DIST_PATH")/" in
+            "$(realpath -- "$GITHUB_WORKSPACE")"/?*/) ;;
+            *) echo "::error::dist-path must be a folder inside the repository, got ${DIST_PATH}"; exit 1 ;;
+          esac
+          rm -rf -- "$DIST_PATH"
+
+      - name: Lay the built bundle over the checkout
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}-candidate
+          path: ${{ inputs.dist-path }}
+
       - name: Compare, and commit on same-repo PRs
         id: sync
         env:
           DIST_PATH: ${{ inputs.dist-path }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          PUSH_TOKEN: ${{ secrets.push-token || github.token }}
         run: |
-          # --porcelain also catches new untracked files, which git diff misses.
+          # Artifacts don't keep file modes, so ignore them. --porcelain also catches new untracked files, which git diff misses.
+          git config core.fileMode false
           if [ -z "$(git status --porcelain -- "$DIST_PATH")" ]; then
             echo "$DIST_PATH is already in sync."
             exit 0
@@ -72,11 +145,19 @@ jobs:
             echo "fork=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if [ "$(git log -1 --format=%s)" = "build: sync dist bundle" ]; then
+            echo "::error::${DIST_PATH} still differs right after a sync commit: the build isn't deterministic on the runner. Not pushing again."
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A -- "$DIST_PATH"
-          git commit -m "build: sync dist bundle"
-          git push origin "HEAD:${HEAD_REF}"
+          git -c core.hooksPath=/dev/null commit -q -m "build: sync dist bundle"
+          # The token is only ever in this command's config, never on disk.
+          auth="$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git -c core.hooksPath=/dev/null -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push -q origin "HEAD:refs/heads/${HEAD_REF}"
           echo "Pushed the rebuilt bundle to ${HEAD_REF}."
 
       - name: Upload the bundle (fork PRs)
@@ -85,14 +166,30 @@ jobs:
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.dist-path }}
-          retention-days: 7
+          if-no-files-found: error
           include-hidden-files: true
+          retention-days: 7
+          overwrite: true
 
       - name: Fail until a maintainer applies it (fork PRs)
         if: steps.sync.outputs.fork == 'true'
         env:
           DIST_PATH: ${{ inputs.dist-path }}
+          ARTIFACT: ${{ inputs.artifact-name }}
           PR: ${{ github.event.pull_request.number }}
+          # In a called workflow, github.workflow_ref names the caller: owner/repo/.github/workflows/dist.yml@refs/...
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          echo "::error::${DIST_PATH} needs the CI-built bundle. Contributors: nothing to do, please don't commit ${DIST_PATH} yourself. Maintainers: npx action-dist-sync ${PR}"
+          cmd="npx action-dist-sync ${PR}"
+          hint=""
+          file="${WORKFLOW_REF%%@*}"
+          file="${file##*/}"
+          case "$file" in
+            dist.yml) ;;
+            *.yml | *.yaml) cmd+=" --workflow $(printf '%q' "$file")" ;;
+            *) hint=" (add --workflow <file> if the calling workflow isn't dist.yml)" ;;
+          esac
+          [ "$DIST_PATH" != "dist" ] && cmd+=" --dist-path $(printf '%q' "$DIST_PATH")"
+          [ "$ARTIFACT" != "action-dist" ] && cmd+=" --artifact $(printf '%q' "$ARTIFACT")"
+          echo "::error::${DIST_PATH} needs the CI-built bundle. Contributors: nothing to do, please don't commit ${DIST_PATH} yourself. Maintainers: ${cmd}${hint}"
           exit 1
