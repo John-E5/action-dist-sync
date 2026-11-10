@@ -1,6 +1,6 @@
 {
   "name": "action-dist-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Fork-safe dist/ syncing for JavaScript GitHub Actions: CI builds the bundle, same-repo PRs get it committed, fork PRs get it applied with one command.",
   "type": "module",
   "license": "MIT",
