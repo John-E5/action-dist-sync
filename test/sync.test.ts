@@ -1,10 +1,10 @@
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Exec, ExecResult } from '../src/exec.js';
 import { syncFork, SyncError } from '../src/sync.js';
 
-type Call = { cmd: string; args: string[]; cwd?: string };
+type Call = { cmd: string; args: string[]; cwd?: string; env?: Record<string, string> };
 type Handler = (call: Call) => ExecResult | Promise<ExecResult>;
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 
@@ -17,7 +17,14 @@ const PR = {
   isCrossRepository: true,
 };
 
-/** A fake gh/git. Each handler key is "cmd sub1 sub2"; `git -c x=y sub` is keyed on `sub`. Unknown calls fail the test. */
+/** The words after `cmd` with `-c x=y` pairs and leading `--global-options` dropped. */
+const words = (args: string[]) => {
+  const out = args.filter((a, i) => a !== '-c' && args[i - 1] !== '-c');
+  while (out[0]?.startsWith('--')) out.shift();
+  return out;
+};
+
+/** A fake gh/git. Each handler key is "cmd sub1 sub2"; git is keyed on its subcommand alone. Unknown calls fail the test. */
 function fake(overrides: Record<string, Handler> = {}) {
   const calls: Call[] = [];
   const snapshot: { dist?: string[]; stale?: boolean; content?: string } = {};
@@ -49,19 +56,21 @@ function fake(overrides: Record<string, Handler> = {}) {
     'git push': () => ok(),
     ...overrides,
   };
+  const temps: string[] = [];
   const exec: Exec = async (cmd, args, opts = {}) => {
-    const call = { cmd, args, cwd: opts.cwd };
+    const call: Call = { cmd, args, cwd: opts.cwd };
     calls.push(call);
-    const words = args.filter((a, i) => a !== '-c' && args[i - 1] !== '-c');
-    const key = `${cmd} ${words.slice(0, cmd === 'git' ? 1 : 2).join(' ')}`;
+    const key = `${cmd} ${words(args).slice(0, cmd === 'git' ? 1 : 2).join(' ')}`;
+    if (key === 'gh run download') temps.push(dirname(args[args.indexOf('-D') + 1]!));
     const handler = handlers[key];
     if (!handler) throw new Error(`unexpected call: ${cmd} ${args.join(' ')}`);
     return handler(call);
   };
-  return { exec, calls, snapshot };
+  return { exec, calls, snapshot, temps };
 }
 
-const keys = (calls: Call[]) => calls.map((c) => `${c.cmd} ${c.args.filter((a, i) => a !== '-c' && c.args[i - 1] !== '-c')[0]}`);
+const keys = (calls: Call[]) => calls.map((c) => `${c.cmd} ${words(c.args)[0]}`);
+const fail = (stderr: string): ExecResult => ({ code: 128, stdout: '', stderr });
 
 describe('syncFork', () => {
   it('replaces dist/ with the CI artifact, then commits and pushes to the fork branch', async () => {
@@ -142,4 +151,33 @@ describe('syncFork', () => {
       expect(f.calls).toHaveLength(0);
     }
   });
+
+  it('runs add, diff, commit and push inside the clone', async () => {
+    const f = fake();
+    await syncFork({ pr: 7, repo: 'o/r' }, f.exec);
+    const clone = f.calls.find((c) => words(c.args)[0] === 'clone')!.args.at(-1)!;
+    for (const sub of ['add', 'diff', 'commit', 'push']) {
+      expect(f.calls.find((c) => c.cmd === 'git' && words(c.args)[0] === sub)!.cwd).toBe(clone);
+    }
+  });
+
+  it('removes its temp dir after a push', async () => {
+    const f = fake();
+    await syncFork({ pr: 7, repo: 'o/r' }, f.exec);
+    expect(f.temps).toHaveLength(1);
+    expect(existsSync(f.temps[0]!)).toBe(false);
+  });
+
+  it('removes its temp dir after a failure', async () => {
+    const f = fake({ 'git push': () => fail('rejected') });
+    await syncFork({ pr: 7, repo: 'o/r' }, f.exec).catch(() => {});
+    expect(f.temps).toHaveLength(1);
+    expect(existsSync(f.temps[0]!)).toBe(false);
+  });
+
+  it("reports a failed clone with git's message", () => refuses({ 'git clone': () => fail('fatal: Remote branch fix-typo not found') }, 'Remote branch fix-typo not found', 2));
+
+  it("reports a failed push with git's message", () => refuses({ 'git push': () => fail('! [rejected] HEAD -> fix-typo (fetch first)') }, '[rejected] HEAD -> fix-typo', 2));
+
+  it("reports a failed comparison with git's message", () => refuses({ 'git diff': () => fail('fatal: bad object HEAD') }, 'bad object HEAD', 2));
 });
