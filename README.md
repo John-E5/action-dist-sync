@@ -69,7 +69,8 @@ npx action-dist-sync <pr> [--repo owner/name] [--dist-path dist] [--workflow dis
 ```
 
 **Requirements:**
-- The [GitHub CLI](https://cli.github.com), signed in. Run `gh auth setup-git` once so `git push` uses it.
+- The [GitHub CLI](https://cli.github.com), signed in. The clone and push use gh's credentials directly, whatever credential helper git has, and never prompt. No `gh auth setup-git` is needed.
+- `git` on PATH, with your name and email configured for the commit.
 - "Allow edits by maintainers" ticked on the PR.
 
 **It checks before touching anything:** the PR must come from a fork, maintainers must be allowed to edit it, and the workflow run for the head commit must have finished with the artifact present.

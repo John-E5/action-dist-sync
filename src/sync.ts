@@ -5,6 +5,16 @@ import type { Exec, ExecResult } from './exec.js';
 
 export const DEFAULTS = { distPath: 'dist', workflow: 'dist.yml', artifact: 'action-dist' } as const;
 const COMMIT_MESSAGE = 'build: sync dist bundle';
+/** Clone and push with gh's token, whatever credential helper git has; never fall back to a prompt. */
+const GH_CREDENTIALS = ['-c', 'credential.https://github.com.helper=', '-c', 'credential.https://github.com.helper=!gh auth git-credential'];
+const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0' };
+
+interface RunOptions {
+  cwd?: string;
+  env?: Record<string, string>;
+  /** Appended to the failure message. */
+  hint?: string;
+}
 
 export interface SyncOptions {
   /** Pull request number. */
@@ -55,9 +65,9 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
   const log = options.log ?? (() => {});
   const n = options.pr;
 
-  const run = async (cmd: string, args: string[], cwd?: string): Promise<ExecResult> => {
+  const run = async (cmd: string, args: string[], { cwd, env }: RunOptions = {}): Promise<ExecResult> => {
     try {
-      return await exec(cmd, args, { cwd });
+      return await exec(cmd, args, env ? { cwd, env } : { cwd });
     } catch (err) {
       if ((err as { code?: unknown }).code === 'ENOENT') {
         throw new SyncError(
@@ -68,9 +78,12 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
       throw err;
     }
   };
-  const must = async (cmd: string, args: string[], what: string, cwd?: string): Promise<string> => {
-    const r = await run(cmd, args, cwd);
-    if (r.code !== 0) throw new SyncError(`${what} failed: ${(r.stderr || r.stdout).trim()}`, 2);
+  const must = async (cmd: string, args: string[], what: string, opts: RunOptions = {}): Promise<string> => {
+    const r = await run(cmd, args, opts);
+    if (r.code !== 0) {
+      const hint = opts.hint ? `\n${opts.hint}` : '';
+      throw new SyncError(`${what} failed: ${(r.stderr || r.stdout).trim()}${hint}`, 2);
+    }
     return r.stdout.trim();
   };
 
@@ -107,21 +120,30 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
 
     const clone = join(tmp, 'repo');
     log(`Cloning ${headRepo}:${headRef}`);
-    await must('git', ['-c', 'core.autocrlf=false', 'clone', '-q', '--depth', '1', '--branch', headRef, `https://github.com/${headRepo}.git`, clone], `Cloning ${headRepo}`);
+    await must(
+      'git',
+      [...GH_CREDENTIALS, '-c', 'core.autocrlf=false', 'clone', '-q', '--depth', '1', '--branch', headRef, `https://github.com/${headRepo}.git`, clone],
+      `Cloning ${headRepo}`,
+      { env: NO_PROMPT },
+    );
 
     const target = await checkNoSymlinks(clone, distPath, `${headRepo}:${headRef}`);
     await rm(target, { recursive: true, force: true });
     await mkdir(target, { recursive: true });
     await cp(bundle, target, { recursive: true });
 
-    await must('git', ['--literal-pathspecs', '-c', 'core.autocrlf=false', 'add', '-A', '--', distPath], 'Staging the bundle', clone);
-    const diff = await run('git', ['diff', '--cached', '--quiet'], clone);
+    await must('git', ['--literal-pathspecs', '-c', 'core.autocrlf=false', 'add', '-A', '--', distPath], 'Staging the bundle', { cwd: clone });
+    const diff = await run('git', ['diff', '--cached', '--quiet'], { cwd: clone });
     if (diff.code === 0) return { status: 'in-sync', headRepo, headRef };
     if (diff.code !== 1) throw new SyncError(`Comparing the bundle failed: ${diff.stderr.trim()}`, 2);
 
-    await must('git', ['-c', 'core.autocrlf=false', 'commit', '-q', '-m', COMMIT_MESSAGE], 'Committing the bundle', clone);
+    await must('git', ['-c', 'core.autocrlf=false', 'commit', '-q', '-m', COMMIT_MESSAGE], 'Committing the bundle', { cwd: clone });
     log(`Pushing to ${headRepo}:${headRef}`);
-    await must('git', ['push', '-q', 'origin', `HEAD:${headRef}`], `Pushing to ${headRepo}`, clone);
+    await must('git', [...GH_CREDENTIALS, 'push', '-q', 'origin', `HEAD:${headRef}`], `Pushing to ${headRepo}`, {
+      cwd: clone,
+      env: NO_PROMPT,
+      hint: "Check `gh auth status`; the push uses gh's credentials.",
+    });
     return { status: 'pushed', headRepo, headRef };
   } finally {
     await rm(tmp, { recursive: true, force: true });

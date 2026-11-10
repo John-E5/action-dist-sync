@@ -59,7 +59,7 @@ function fake(overrides: Record<string, Handler> = {}) {
   };
   const temps: string[] = [];
   const exec: Exec = async (cmd, args, opts = {}) => {
-    const call: Call = { cmd, args, cwd: opts.cwd };
+    const call: Call = { cmd, args, cwd: opts.cwd, env: opts.env };
     calls.push(call);
     const key = `${cmd} ${words(args).slice(0, cmd === 'git' ? 1 : 2).join(' ')}`;
     if (key === 'gh run download') temps.push(dirname(args[args.indexOf('-D') + 1]!));
@@ -82,7 +82,7 @@ describe('syncFork', () => {
     expect(keys(f.calls)).toEqual(['gh pr', 'gh run', 'gh run', 'git clone', 'git add', 'git diff', 'git commit', 'git push']);
     const clone = f.calls.find((c) => c.args.includes('clone'))!;
     expect(clone.args).toEqual(expect.arrayContaining(['--depth', '1', '--branch', 'fix-typo', 'https://github.com/contrib/my-action.git']));
-    expect(f.calls.find((c) => c.args.includes('push'))!.args).toEqual(['push', '-q', 'origin', 'HEAD:fix-typo']);
+    expect(words(f.calls.find((c) => c.args.includes('push'))!.args)).toEqual(['push', '-q', 'origin', 'HEAD:fix-typo']);
     expect(f.calls.find((c) => c.args.includes('commit'))!.args).toEqual(expect.arrayContaining(['-m', 'build: sync dist bundle']));
     const list = f.calls.find((c) => c.args[1] === 'list')!;
     expect(list.args).toEqual(expect.arrayContaining(['--workflow', 'dist.yml', '--commit', 'abc1234def5678']));
@@ -233,4 +233,19 @@ describe('syncFork', () => {
       }
     });
   }
+
+  it("clones and pushes with gh's credentials and never prompts", async () => {
+    const f = fake();
+    await syncFork({ pr: 7, repo: 'o/r' }, f.exec);
+    const helper = ['-c', 'credential.https://github.com.helper=', '-c', 'credential.https://github.com.helper=!gh auth git-credential'];
+    for (const sub of ['clone', 'push']) {
+      const call = f.calls.find((c) => c.cmd === 'git' && words(c.args)[0] === sub)!;
+      const at = call.args.indexOf(sub);
+      expect(call.args.slice(0, at).join(' ')).toContain(helper.join(' '));
+      expect(call.env).toEqual({ GIT_TERMINAL_PROMPT: '0' });
+    }
+  });
+
+  it('points at gh auth when the push fails', () =>
+    refuses({ 'git push': () => fail('fatal: could not read Username for https://github.com: terminal prompts disabled') }, "Check `gh auth status`; the push uses gh's credentials.", 2));
 });
