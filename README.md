@@ -112,4 +112,4 @@ Node 22 or later for the CLI. The workflow runs on `ubuntu-latest`.
 
 ---
 
-Extracted from [drift-ci](https://github.com/Drift-CI/drift-ci), whose GitHub Action has used this flow for every PR since it went public. MIT licensed.
+Extracted from [drift-ci](https://github.com/Drift-CI/drift-ci), whose GitHub Action has used this flow for every PR since it went public. Verified end to end on GitHub (November 2026): a same-repo PR got the rebuilt bundle committed, and a fork PR failed with the sync command, which applied the bundle and turned it green. MIT licensed.
