@@ -158,7 +158,7 @@ export async function syncFork(options: SyncOptions, exec: Exec): Promise<SyncRe
     if (diff.code === 0) return { status: 'in-sync', headRepo, headRef };
     if (diff.code !== 1) throw new SyncError(`Comparing the bundle failed: ${diff.stderr.trim()}`, 2);
 
-    await must('git', ['-c', 'core.autocrlf=false', 'commit', '-q', '-m', COMMIT_MESSAGE], 'Committing the bundle', { cwd: clone });
+    await must('git', ['-c', 'core.autocrlf=false', 'commit', '-q', '--signoff', '-m', COMMIT_MESSAGE], 'Committing the bundle', { cwd: clone });
     log(`Pushing to ${headRepo}:${headRef}`);
     await must('git', [...GH_CREDENTIALS, 'push', '-q', 'origin', `HEAD:${headRef}`], `Pushing to ${headRepo}`, {
       cwd: clone,
