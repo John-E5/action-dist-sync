@@ -85,6 +85,8 @@ describe('syncFork', () => {
     expect(clone.args).toEqual(expect.arrayContaining(['--depth', '1', '--branch', 'fix-typo', 'https://github.com/contrib/my-action.git']));
     expect(words(f.calls.find((c) => c.args.includes('push'))!.args)).toEqual(['push', '-q', 'origin', 'HEAD:fix-typo']);
     expect(f.calls.find((c) => c.args.includes('commit'))!.args).toEqual(expect.arrayContaining(['-m', 'build: sync dist bundle']));
+    // Signed off as the maintainer running the sync, so DCO checks on the PR pass.
+    expect(f.calls.find((c) => c.args.includes('commit'))!.args).toContain('--signoff');
     const list = f.calls.find((c) => c.args[1] === 'list')!;
     expect(list.args).toEqual(expect.arrayContaining(['--workflow', 'dist.yml', '--commit', 'abc1234def5678', '--json', 'databaseId,status,conclusion']));
   });

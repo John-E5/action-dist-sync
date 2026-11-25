@@ -97,7 +97,7 @@ If that run passed, CI already found the bundle in sync, so it stops there and c
 **Then it:**
 1. Shallow-clones the fork branch, and checks the branch hasn't moved past the commit the run built.
 2. Replaces `dist-path` with the artifact. It refuses if `dist-path`, or a folder above it, is a symlink in the fork.
-3. Commits `build: sync dist bundle`, and pushes. If the bundle already matches, it stops and changes nothing.
+3. Commits `build: sync dist bundle`, signed off as you (`--signoff`, so DCO checks on the PR pass), and pushes. If the bundle already matches, it stops and changes nothing.
 
 **Defaults:** `--repo` defaults to the repository in the current folder, and `--workflow` matches the file name of your caller workflow (`dist.yml` above). `--dist-path` must be a folder inside the repository; it can't contain `..` past the root, a `:`, or a `.git` folder.
 
