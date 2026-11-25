@@ -7,11 +7,18 @@ name: Release
 # and v0 tags by hand. Later releases move the v0 tag themselves.
 # Release PRs are opened with GITHUB_TOKEN, so CI does not run on them. If checks
 # are required, a maintainer re-runs them or merges with admin.
+# If a release was tagged but its npm publish failed, run this workflow by hand with
+# publish-tag set to that tag (e.g. v0.1.1): it publishes that tag and moves v<major>.
 
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      publish-tag:
+        description: Publish an existing release tag to npm (e.g. v0.1.1) instead of running release-please
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -20,6 +27,7 @@ permissions:
 
 jobs:
   release:
+    if: ${{ !inputs.publish-tag }}
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
@@ -40,3 +48,30 @@ jobs:
         env:
           MAJOR: ${{ steps.release.outputs.major }}
         run: git tag -f "v${MAJOR}" && git push -f origin "v${MAJOR}"
+
+  republish:
+    if: ${{ inputs.publish-tag }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.publish-tag }}
+    steps:
+      - name: Check the tag
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::publish-tag must look like v1.2.3"; exit 1; fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.publish-tag }}
+      - name: Check the tag matches package.json
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$TAG" ]; then echo "::error::$TAG is package version $version"; exit 1; fi
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install -g npm@^11.5.1
+      - run: npm ci && npm run build && npm publish --provenance --access public
+      - name: Move the v<major> tag
+        run: |
+          major="${TAG%%.*}"
+          git tag -f "$major" && git push -f origin "$major"
